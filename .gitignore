@@ -1,0 +1,21 @@
+
+# Maven build output
+target/
+
+# Large/private electricity dataset
+data/
+dataset/
+*.csv
+*.xlsx
+*.xls
+
+# Java IDE files
+.vscode/
+.idea/
+.classpath
+.project
+.settings/
+
+# Operating system files
+.DS_Store
+Thumbs.db
