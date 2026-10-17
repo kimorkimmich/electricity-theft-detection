@@ -106,7 +106,7 @@ public class DatasetPanel extends JPanel {
         add(statusLabel, BorderLayout.SOUTH);
 
         // Automatically attempt to load the default CSV.
-        Path defaultFile = Paths.get("data", "SGCC.csv");
+        Path defaultFile = Paths.get("dataset", "sgcc_cleaned.csv");
 
         if (Files.isRegularFile(defaultFile)) {
             loadFile(defaultFile);
