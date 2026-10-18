@@ -1,6 +1,7 @@
 
 package com.electricitytheft;
 
+import java.io.IOException;
 import java.io.Reader;
 import java.io.Writer;
 import java.nio.charset.StandardCharsets;
@@ -9,11 +10,11 @@ import java.nio.file.Path;
 import java.nio.file.Paths;
 import java.time.LocalDate;
 import java.time.format.DateTimeFormatter;
+import java.time.format.DateTimeParseException;
 import java.util.ArrayList;
-import java.util.Arrays;
 import java.util.Comparator;
-import java.util.Iterator;
 import java.util.List;
+import java.util.Locale;
 
 import org.apache.commons.csv.CSVFormat;
 import org.apache.commons.csv.CSVParser;
@@ -30,21 +31,39 @@ public class FeatureExtractor {
 
     private static final int RECENT_DAYS = 30;
 
-    private static final String[] OUTPUT_HEADER = {
-            "CONS_NO", "FLAG",
-            "MEAN", "STD_DEV", "MIN", "MAX",
-            "CV", "PAR", "TOTAL",
-            "TREND", "LAG7_AUTOCORR",
-            "CONSUMPTION_DEVIATION"
-    };
+    private static final DateTimeFormatter DATE_FORMAT =
+            DateTimeFormatter.ofPattern("M/d/uuuu");
 
-    public static void main(String[] args) {
+    // Stores a consumption column and its date.
+    private static class DateColumn {
+        int index;
+        LocalDate date;
+
+        DateColumn(int index, LocalDate date) {
+            this.index = index;
+            this.date = date;
+        }
+    }
+
+    public static void main(String[] args) throws IOException {
+
+        System.out.println("Starting SGCC feature extraction...");
+
+        if (!Files.exists(INPUT)) {
+            throw new IOException(
+                    "Input dataset not found: "
+                    + INPUT.toAbsolutePath());
+        }
+
+        int processed = 0;
+        int skipped = 0;
 
         try (
             Reader reader = Files.newBufferedReader(
                     INPUT, StandardCharsets.UTF_8);
 
-            CSVParser parser = CSVFormat.DEFAULT.parse(reader);
+            CSVParser parser =
+                    CSVFormat.DEFAULT.parse(reader);
 
             Writer writer = Files.newBufferedWriter(
                     OUTPUT, StandardCharsets.UTF_8);
@@ -53,11 +72,12 @@ public class FeatureExtractor {
                     writer, CSVFormat.DEFAULT)
         ) {
 
-            Iterator<CSVRecord> iterator = parser.iterator();
+            // Read the first CSV row as the header.
+            java.util.Iterator<CSVRecord> iterator =
+                    parser.iterator();
 
             if (!iterator.hasNext()) {
-                throw new IllegalArgumentException(
-                        "Dataset is empty");
+                throw new IOException("Input CSV is empty.");
             }
 
             CSVRecord header = iterator.next();
@@ -65,356 +85,423 @@ public class FeatureExtractor {
             int idIndex = -1;
             int flagIndex = -1;
 
-            List<Integer> consumptionColumns =
+            List<DateColumn> dateColumns =
                     new ArrayList<>();
 
-            // Identify metadata and daily readings
+            // Identify metadata and date columns.
             for (int i = 0; i < header.size(); i++) {
 
-                String column = header.get(i)
-                        .trim()
+                String name = header.get(i).trim()
                         .replace("\uFEFF", "");
 
-                if (column.equalsIgnoreCase("CONS_NO")) {
+                String normalized = name
+                        .replace("_", "")
+                        .replace(" ", "")
+                        .toUpperCase(Locale.ROOT);
+
+                if (normalized.equals("CONSNO")
+                        || normalized.equals("CUSTOMERID")) {
+
                     idIndex = i;
-                } else if (column.equalsIgnoreCase("FLAG")) {
+                    continue;
+                }
+
+                if (normalized.equals("FLAG")
+                        || normalized.equals("LABEL")
+                        || normalized.equals("ISTHEFT")) {
+
                     flagIndex = i;
-                } else {
-                    consumptionColumns.add(i);
+                    continue;
+                }
+
+                try {
+                    LocalDate date =
+                            LocalDate.parse(name, DATE_FORMAT);
+
+                    dateColumns.add(new DateColumn(i, date));
+
+                } catch (DateTimeParseException ignored) {
+                    // Non-date columns are not consumption readings.
                 }
             }
 
-            if (idIndex == -1 || flagIndex == -1) {
-                throw new IllegalArgumentException(
-                        "CONS_NO or FLAG column missing");
+            if (flagIndex == -1) {
+                throw new IOException(
+                        "Theft label column (FLAG) not found.");
             }
 
-            // Arrange daily readings chronologically.
-            // Supports date columns such as 2014/1/1,
-            // 2014-01-01, or 1/1/2014.
-            consumptionColumns.sort(
-                    Comparator.comparing(
-                            i -> parseDate(header.get(i).trim())
-                    )
+            if (dateColumns.isEmpty()) {
+                throw new IOException(
+                        "No daily consumption date columns found.");
+            }
+
+            // Ensure chronological order.
+            dateColumns.sort(
+                    Comparator.comparing(column -> column.date));
+
+            System.out.println(
+                    "Daily consumption columns: "
+                    + dateColumns.size());
+
+            System.out.println(
+                    "First date: " + dateColumns.get(0).date);
+
+            System.out.println(
+                    "Last date: "
+                    + dateColumns.get(dateColumns.size() - 1).date);
+
+            System.out.println(
+                    "Customer ID column found: " + (idIndex >= 0));
+
+            // Write output CSV header.
+            printer.printRecord(
+                    "CONS_NO",
+                    "FLAG",
+                    "MEAN",
+                    "STD_DEV",
+                    "MIN",
+                    "MAX",
+                    "CV",
+                    "PAR",
+                    "TOTAL",
+                    "TREND",
+                    "LAG7_AUTOCORR",
+                    "CONSUMPTION_DEVIATION"
             );
 
-            printer.printRecord((Object[]) OUTPUT_HEADER);
-
-            int customerCount = 0;
-
+            // Process every customer.
             while (iterator.hasNext()) {
 
                 CSVRecord record = iterator.next();
 
                 if (record.size() != header.size()) {
-                    throw new IllegalArgumentException(
-                            "Invalid CSV row: "
-                            + record.getRecordNumber());
+                    skipped++;
+                    continue;
                 }
 
-                String customerId = record.get(idIndex);
-                String flag = record.get(flagIndex);
+                String customerId = idIndex >= 0
+                        ? record.get(idIndex).trim()
+                        : String.valueOf(processed + skipped + 1);
+
+                String flag = record.get(flagIndex).trim();
 
                 double[] readings =
-                        new double[consumptionColumns.size()];
+                        new double[dateColumns.size()];
 
-                for (int i = 0; i < readings.length; i++) {
+                // Extract daily readings in date order.
+                for (int i = 0; i < dateColumns.size(); i++) {
 
                     String value = record.get(
-                            consumptionColumns.get(i)).trim();
+                            dateColumns.get(i).index).trim();
 
-                    if (value.isEmpty()
-                            || value.equalsIgnoreCase("NaN")
-                            || value.equalsIgnoreCase("null")) {
-
-                        readings[i] = Double.NaN;
-
-                    } else {
-
-                        readings[i] = Double.parseDouble(value);
-
-                        if (!Double.isFinite(readings[i])) {
-                            readings[i] = Double.NaN;
-                        }
-                    }
+                    readings[i] = parseConsumption(value);
                 }
 
-                double mean = mean(readings);
-                double std = standardDeviation(readings, mean);
-                double min = minimum(readings);
-                double max = maximum(readings);
-                double total = total(readings);
-
-                double cv = safeDivide(std, mean);
-                double par = safeDivide(max, mean);
-
-                double trend = consumptionTrend(readings);
-                double lag7 = lag7Autocorrelation(readings);
-
-                double deviation =
-                        consumptionDeviation(readings);
+                double[] features =
+                        calculateFeatures(readings);
 
                 printer.printRecord(
                         customerId,
                         flag,
-                        mean,
-                        std,
-                        min,
-                        max,
-                        cv,
-                        par,
-                        total,
-                        trend,
-                        lag7,
-                        deviation
+                        features[0],
+                        features[1],
+                        features[2],
+                        features[3],
+                        features[4],
+                        features[5],
+                        features[6],
+                        features[7],
+                        features[8],
+                        features[9]
                 );
 
-                customerCount++;
+                processed++;
+
+                if (processed % 5000 == 0) {
+                    System.out.println(
+                            "Processed " + processed + " customers");
+                }
             }
 
-            printer.flush();
+        }
 
-            System.out.println(
-                    "Feature extraction completed.");
-            System.out.println(
-                    "Customers processed: " + customerCount);
-            System.out.println(
-                    "Features per customer: 10");
-            System.out.println(
-                    "Saved: " + OUTPUT);
+        System.out.println("\nFeature extraction completed!");
+        System.out.println("Customers processed: " + processed);
+        System.out.println("Rows skipped: " + skipped);
+        System.out.println(
+                "Output: " + OUTPUT.toAbsolutePath());
+    }
 
-        } catch (Exception e) {
-            e.printStackTrace();
+    // Converts a CSV value into a numeric reading.
+    private static double parseConsumption(String value) {
+
+        if (value.isEmpty()
+                || value.equalsIgnoreCase("NaN")
+                || value.equalsIgnoreCase("null")
+                || value.equalsIgnoreCase("NA")) {
+
+            return Double.NaN;
+        }
+
+        try {
+            double result = Double.parseDouble(value);
+
+            return Double.isFinite(result)
+                    ? result
+                    : Double.NaN;
+
+        } catch (NumberFormatException e) {
+            return Double.NaN;
         }
     }
 
-    // Parse SGCC date column names
-    private static LocalDate parseDate(String value) {
+    // Calculates all 10 numerical features.
+    private static double[] calculateFeatures(double[] readings) {
 
-        String[] formats = {
-                "yyyy/M/d",
-                "yyyy-M-d",
-                "M/d/yyyy",
-                "M-d-yyyy",
-                "d.M.yyyy"
-        };
+        List<Double> valid = new ArrayList<>();
 
-        for (String format : formats) {
-            try {
-                return LocalDate.parse(
-                        value,
-                        DateTimeFormatter.ofPattern(format));
-            } catch (Exception ignored) {
-                // Try the next format
-            }
-        }
-
-        throw new IllegalArgumentException(
-                "Unrecognized consumption date: " + value);
-    }
-
-    // 1. Mean consumption
-    private static double mean(double[] values) {
-
-        double sum = 0;
-        int count = 0;
-
-        for (double value : values) {
+        for (double value : readings) {
             if (Double.isFinite(value)) {
-                sum += value;
-                count++;
+                valid.add(value);
             }
         }
 
-        return count == 0 ? 0 : sum / count;
-    }
+        int n = valid.size();
 
-    // 2. Population standard deviation
-    private static double standardDeviation(
-            double[] values, double mean) {
+        double[] result = new double[10];
 
-        double sum = 0;
-        int count = 0;
-
-        for (double value : values) {
-            if (Double.isFinite(value)) {
-                sum += Math.pow(value - mean, 2);
-                count++;
-            }
+        if (n == 0) {
+            return result;
         }
 
-        return count == 0 ? 0 : Math.sqrt(sum / count);
-    }
-
-    // 3. Minimum consumption
-    private static double minimum(double[] values) {
+        // FEATURE 1: Mean consumption
+        double total = 0;
 
         double min = Double.POSITIVE_INFINITY;
-
-        for (double value : values) {
-            if (Double.isFinite(value)) {
-                min = Math.min(min, value);
-            }
-        }
-
-        return Double.isInfinite(min) ? 0 : min;
-    }
-
-    // 4. Maximum consumption
-    private static double maximum(double[] values) {
-
         double max = Double.NEGATIVE_INFINITY;
 
-        for (double value : values) {
-            if (Double.isFinite(value)) {
-                max = Math.max(max, value);
-            }
+        for (double value : valid) {
+
+            total += value;
+
+            min = Math.min(min, value);
+            max = Math.max(max, value);
         }
 
-        return Double.isInfinite(max) ? 0 : max;
-    }
+        double mean = total / n;
 
-    // 5. CV and 6. PAR use safe division
-    private static double safeDivide(
-            double numerator, double denominator) {
+        // FEATURE 2: Population standard deviation
+        double squaredDifferenceSum = 0;
 
-        if (Math.abs(denominator) < 1e-10) {
-            return 0;
+        for (double value : valid) {
+            squaredDifferenceSum +=
+                    Math.pow(value - mean, 2);
         }
 
-        return numerator / denominator;
+        double stdDev =
+                Math.sqrt(squaredDifferenceSum / n);
+
+        // FEATURE 3: Minimum consumption
+        // Already calculated as min.
+
+        // FEATURE 4: Maximum consumption
+        // Already calculated as max.
+
+        // FEATURE 5: Coefficient of variation
+        double cv = mean != 0
+                ? stdDev / Math.abs(mean)
+                : 0;
+
+        // FEATURE 6: Peak-to-average ratio
+        double par = mean != 0
+                ? max / mean
+                : 0;
+
+        // FEATURE 7: Total consumption
+        // Already calculated as total.
+
+        // FEATURE 8: Linear consumption trend
+        // Uses actual day positions to preserve time gaps.
+        double trend = calculateTrend(readings);
+
+        // FEATURE 9: Lag-7 autocorrelation
+        double lag7 = calculateAutocorrelation(readings, 7);
+
+        // FEATURE 10: Recent consumption deviation
+        double deviation =
+                calculateDeviation(readings, RECENT_DAYS);
+
+        result[0] = finiteOrZero(mean);
+        result[1] = finiteOrZero(stdDev);
+        result[2] = finiteOrZero(min);
+        result[3] = finiteOrZero(max);
+        result[4] = finiteOrZero(cv);
+        result[5] = finiteOrZero(par);
+        result[6] = finiteOrZero(total);
+        result[7] = finiteOrZero(trend);
+        result[8] = finiteOrZero(lag7);
+        result[9] = finiteOrZero(deviation);
+
+        return result;
     }
 
-    // 7. Total consumption
-    private static double total(double[] values) {
+    // Linear regression slope of consumption over time.
+    private static double calculateTrend(double[] readings) {
 
-        double sum = 0;
-
-        for (double value : values) {
-            if (Double.isFinite(value)) {
-                sum += value;
-            }
-        }
-
-        return sum;
-    }
-
-    // 8. Consumption trend: linear regression slope
-    private static double consumptionTrend(double[] values) {
+        int n = 0;
 
         double sumX = 0;
         double sumY = 0;
         double sumXX = 0;
         double sumXY = 0;
 
-        int count = 0;
+        for (int i = 0; i < readings.length; i++) {
 
-        for (int i = 0; i < values.length; i++) {
+            double y = readings[i];
 
-            if (!Double.isFinite(values[i])) {
+            if (!Double.isFinite(y)) {
                 continue;
             }
 
             double x = i;
-            double y = values[i];
+
+            n++;
 
             sumX += x;
             sumY += y;
             sumXX += x * x;
             sumXY += x * y;
+        }
 
-            count++;
+        if (n < 2) {
+            return 0;
+        }
+
+        double denominator =
+                n * sumXX - sumX * sumX;
+
+        if (denominator == 0) {
+            return 0;
+        }
+
+        return (n * sumXY - sumX * sumY)
+                / denominator;
+    }
+
+    // Pearson autocorrelation at a specified lag.
+    private static double calculateAutocorrelation(
+            double[] readings, int lag) {
+
+        if (readings.length <= lag) {
+            return 0;
+        }
+
+        int count = 0;
+
+        double sumX = 0;
+        double sumY = 0;
+
+        // Only include pairs where both readings exist.
+        for (int i = lag; i < readings.length; i++) {
+
+            double x = readings[i - lag];
+            double y = readings[i];
+
+            if (Double.isFinite(x)
+                    && Double.isFinite(y)) {
+
+                sumX += x;
+                sumY += y;
+                count++;
+            }
         }
 
         if (count < 2) {
             return 0;
         }
 
-        double denominator =
-                count * sumXX - sumX * sumX;
+        double meanX = sumX / count;
+        double meanY = sumY / count;
 
-        if (Math.abs(denominator) < 1e-10) {
+        double numerator = 0;
+        double denominatorX = 0;
+        double denominatorY = 0;
+
+        for (int i = lag; i < readings.length; i++) {
+
+            double x = readings[i - lag];
+            double y = readings[i];
+
+            if (!Double.isFinite(x)
+                    || !Double.isFinite(y)) {
+                continue;
+            }
+
+            double dx = x - meanX;
+            double dy = y - meanY;
+
+            numerator += dx * dy;
+            denominatorX += dx * dx;
+            denominatorY += dy * dy;
+        }
+
+        double denominator =
+                Math.sqrt(denominatorX * denominatorY);
+
+        if (denominator == 0) {
             return 0;
         }
 
-        return (count * sumXY - sumX * sumY)
-                / denominator;
+        return numerator / denominator;
     }
 
-    // 9. Lag-7 autocorrelation
-    private static double lag7Autocorrelation(
-            double[] values) {
+    // Compare the latest 30 valid readings
+    // with all earlier valid readings.
+    private static double calculateDeviation(
+            double[] readings, int recentDays) {
 
-        List<Double> current = new ArrayList<>();
-        List<Double> previous = new ArrayList<>();
+        List<Double> valid = new ArrayList<>();
 
-        for (int i = 7; i < values.length; i++) {
-
-            if (Double.isFinite(values[i])
-                    && Double.isFinite(values[i - 7])) {
-
-                current.add(values[i]);
-                previous.add(values[i - 7]);
+        for (double value : readings) {
+            if (Double.isFinite(value)) {
+                valid.add(value);
             }
         }
 
-        if (current.size() < 2) {
+        int n = valid.size();
+
+        if (n <= recentDays) {
             return 0;
         }
 
-        double meanX = 0;
-        double meanY = 0;
+        double recentSum = 0;
+        double historicalSum = 0;
 
-        for (int i = 0; i < current.size(); i++) {
-            meanX += current.get(i);
-            meanY += previous.get(i);
+        int split = n - recentDays;
+
+        for (int i = 0; i < split; i++) {
+            historicalSum += valid.get(i);
         }
 
-        meanX /= current.size();
-        meanY /= previous.size();
-
-        double numerator = 0;
-        double sumX2 = 0;
-        double sumY2 = 0;
-
-        for (int i = 0; i < current.size(); i++) {
-
-            double dx = current.get(i) - meanX;
-            double dy = previous.get(i) - meanY;
-
-            numerator += dx * dy;
-            sumX2 += dx * dx;
-            sumY2 += dy * dy;
+        for (int i = split; i < n; i++) {
+            recentSum += valid.get(i);
         }
 
-        double denominator = Math.sqrt(sumX2 * sumY2);
+        double historicalMean =
+                historicalSum / split;
 
-        return safeDivide(numerator, denominator);
+        double recentMean =
+                recentSum / recentDays;
+
+        if (historicalMean == 0) {
+            return 0;
+        }
+
+        return (recentMean - historicalMean)
+                / Math.abs(historicalMean);
     }
 
-    // 10. Relative deviation: latest 30 calendar days
-    // compared with all earlier readings
-    private static double consumptionDeviation(
-            double[] values) {
-
-        if (values.length <= RECENT_DAYS) {
-            return 0;
-        }
-
-        int split = values.length - RECENT_DAYS;
-
-        double[] historical =
-                Arrays.copyOfRange(values, 0, split);
-
-        double[] recent =
-                Arrays.copyOfRange(
-                        values, split, values.length);
-
-        double historicalMean = mean(historical);
-        double recentMean = mean(recent);
-
-        return safeDivide(
-                recentMean - historicalMean,
-                historicalMean);
+    private static double finiteOrZero(double value) {
+        return Double.isFinite(value) ? value : 0;
     }
 }
