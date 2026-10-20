@@ -14,18 +14,22 @@ import ml.dmlc.xgboost4j.java.XGBoost;
 
 public class XGBoostTrainer {
 
-    private static final int NUM_FEATURES = 10;
+    // Automatically uses all 17 features
+    private static final int NUM_FEATURES =
+            XGBoostDataLoader.FEATURE_NAMES.length;
+
     private static final int NUM_FOLDS = 5;
     private static final int BOOSTING_ROUNDS = 150;
     private static final double THRESHOLD = 0.50;
 
-    public static void main(String[] args)
-            throws Exception {
+    public static void main(String[] args) throws Exception {
 
-        System.out.println("==================================");
-        System.out.println("POWER GUARD - XGBOOST TRAINING");
-        System.out.println("==================================");
+        System.out.println("====================================");
+        System.out.println("POWER GUARD - XGBOOST BASELINE");
+        System.out.println("FEATURES: " + NUM_FEATURES);
+        System.out.println("====================================");
 
+        // STEP 1: Load consumers and extracted features
         List<XGBoostDataLoader.Consumer> consumers =
                 XGBoostDataLoader.load();
 
@@ -35,42 +39,46 @@ public class XGBoostTrainer {
         int holdoutCount = 0;
         int holdoutTheft = 0;
 
-        for (XGBoostDataLoader.Consumer consumer : consumers) {
+        // STEP 2: Separate development and test customers
+        for (XGBoostDataLoader.Consumer c : consumers) {
 
-            if (consumer.development) {
-                development.add(consumer);
+            if (c.development) {
+                development.add(c);
             } else {
                 holdoutCount++;
 
-                if (consumer.label == 1) {
+                if (c.label == 1) {
                     holdoutTheft++;
                 }
             }
         }
 
-        System.out.println("Total consumers: " + consumers.size());
-        System.out.println("Development records: " + development.size());
-        System.out.println("Holdout records: " + holdoutCount);
+        System.out.println("Total customers: " + consumers.size());
+        System.out.println("Development: " + development.size());
+        System.out.println("Holdout: " + holdoutCount);
         System.out.println("Holdout theft labels: " + holdoutTheft);
-        System.out.println(
-                "Final holdout is excluded from cross-validation.");
+        System.out.println("Final holdout excluded from CV.");
 
         if (development.isEmpty()) {
             throw new IllegalStateException(
-                    "No development records found.");
+                    "Development set is empty.");
         }
 
-        List<Double> foldF1 = new ArrayList<>();
-        List<Double> foldRecall = new ArrayList<>();
+        // Store evaluation results from all five folds
         List<Double> foldPrecision = new ArrayList<>();
+        List<Double> foldRecall = new ArrayList<>();
+        List<Double> foldF1 = new ArrayList<>();
         List<Double> foldAP = new ArrayList<>();
+        List<Double> foldFPR = new ArrayList<>();
+        List<Double> foldTrainingTime = new ArrayList<>();
+        List<Double> foldInferenceTime = new ArrayList<>();
 
+        // STEP 3: Five-fold cross-validation
         for (int fold = 0; fold < NUM_FOLDS; fold++) {
 
-            System.out.println();
-            System.out.println("==================================");
+            System.out.println("\n====================================");
             System.out.println("VALIDATION FOLD " + fold);
-            System.out.println("==================================");
+            System.out.println("====================================");
 
             List<XGBoostDataLoader.Consumer> training =
                     new ArrayList<>();
@@ -78,27 +86,28 @@ public class XGBoostTrainer {
             List<XGBoostDataLoader.Consumer> validation =
                     new ArrayList<>();
 
-            for (XGBoostDataLoader.Consumer consumer
-                    : development) {
+            // Four folds for training, one for validation
+            for (XGBoostDataLoader.Consumer c : development) {
 
-                if (consumer.fold == fold) {
-                    validation.add(consumer);
+                if (c.fold == fold) {
+                    validation.add(c);
                 } else {
-                    training.add(consumer);
+                    training.add(c);
                 }
             }
 
             if (training.isEmpty() || validation.isEmpty()) {
                 throw new IllegalStateException(
-                        "Empty training/validation fold: " + fold);
+                        "Empty training or validation fold: " + fold);
             }
 
+            // STEP 4: Count normal and theft customers
             int positives = 0;
             int negatives = 0;
 
-            for (XGBoostDataLoader.Consumer consumer : training) {
+            for (XGBoostDataLoader.Consumer c : training) {
 
-                if (consumer.label == 1) {
+                if (c.label == 1) {
                     positives++;
                 } else {
                     negatives++;
@@ -110,17 +119,17 @@ public class XGBoostTrainer {
                         "Training fold contains only one class.");
             }
 
+            // STEP 5: Calculate class imbalance weight
             double scalePosWeight =
                     (double) negatives / positives;
 
-            System.out.println(
-                    "Training records: " + training.size());
-
-            System.out.println(
-                    "Validation records: " + validation.size());
+            System.out.println("Training: " + training.size());
+            System.out.println("Validation: " + validation.size());
+            System.out.println("Normal customers: " + negatives);
+            System.out.println("Theft customers: " + positives);
 
             System.out.printf(
-                    "Positive class weight: %.4f%n",
+                    "scale_pos_weight: %.4f%n",
                     scalePosWeight);
 
             DMatrix trainMatrix = null;
@@ -129,31 +138,52 @@ public class XGBoostTrainer {
 
             try {
 
+                // STEP 6: Convert feature vectors to DMatrix
                 trainMatrix = createMatrix(training);
-
                 validationMatrix = createMatrix(validation);
 
+                // STEP 7: XGBoost hyperparameters
                 Map<String, Object> params = new HashMap<>();
 
+                // Binary classification
                 params.put("objective", "binary:logistic");
-                params.put("eval_metric", "logloss");
+                params.put("booster", "gbtree");
+
+                // Histogram-based tree construction
                 params.put("tree_method", "hist");
 
+                // Baseline hyperparameters
                 params.put("max_depth", 5);
                 params.put("eta", 0.05);
                 params.put("min_child_weight", 1);
+
+                // Random sampling
                 params.put("subsample", 0.8);
                 params.put("colsample_bytree", 0.8);
 
+                // Regularization
+                params.put("gamma", 0.0);
+                params.put("lambda", 1.0);
+                params.put("alpha", 0.0);
+
+                // Class imbalance handling
                 params.put(
                         "scale_pos_weight",
                         scalePosWeight);
 
+                // Evaluation metric
+                params.put("eval_metric", "aucpr");
+
+                // Reproducibility
                 params.put("seed", 42);
                 params.put("verbosity", 0);
 
+                // Empty watches: no per-round logging
                 Map<String, DMatrix> watches =
                         new HashMap<>();
+
+                // STEP 8: Train XGBoost
+                long trainingStart = System.nanoTime();
 
                 model = XGBoost.train(
                         trainMatrix,
@@ -163,9 +193,24 @@ public class XGBoostTrainer {
                         null,
                         null);
 
+                double trainingSeconds =
+                        (System.nanoTime() - trainingStart)
+                                / 1e9;
+
+                // STEP 9: Predict validation probabilities
+                long inferenceStart = System.nanoTime();
+
                 float[][] predictions =
                         model.predict(validationMatrix);
 
+                double inferenceSeconds =
+                        (System.nanoTime() - inferenceStart)
+                                / 1e9;
+
+                foldTrainingTime.add(trainingSeconds);
+                foldInferenceTime.add(inferenceSeconds);
+
+                // STEP 10: Initialize confusion matrix
                 int tp = 0;
                 int tn = 0;
                 int fp = 0;
@@ -177,13 +222,11 @@ public class XGBoostTrainer {
                 int[] labels =
                         new int[validation.size()];
 
+                // STEP 11: Evaluate each prediction
                 for (int i = 0; i < validation.size(); i++) {
 
-                    double probability =
-                            predictions[i][0];
-
-                    int actual =
-                            validation.get(i).label;
+                    double probability = predictions[i][0];
+                    int actual = validation.get(i).label;
 
                     int predicted =
                             probability >= THRESHOLD ? 1 : 0;
@@ -202,6 +245,7 @@ public class XGBoostTrainer {
                     }
                 }
 
+                // STEP 12: Calculate evaluation metrics
                 double precision =
                         divide(tp, tp + fp);
 
@@ -222,34 +266,37 @@ public class XGBoostTrainer {
                 foldPrecision.add(precision);
                 foldRecall.add(recall);
                 foldF1.add(f1);
+                foldFPR.add(fpr);
                 foldAP.add(averagePrecision);
 
-                System.out.println();
-                System.out.println("RESULTS");
+                // STEP 13: Display fold results
+                System.out.println("\nRESULTS");
 
                 System.out.printf(
-                        "Precision: %.4f%n",
-                        precision);
+                        "Precision: %.4f%n", precision);
 
                 System.out.printf(
-                        "Recall: %.4f%n",
-                        recall);
+                        "Recall: %.4f%n", recall);
 
                 System.out.printf(
-                        "F1-score: %.4f%n",
-                        f1);
+                        "F1-score: %.4f%n", f1);
 
                 System.out.printf(
                         "Average Precision: %.4f%n",
                         averagePrecision);
 
                 System.out.printf(
-                        "False Positive Rate: %.4f%n",
-                        fpr);
+                        "False Positive Rate: %.4f%n", fpr);
 
-                System.out.println();
-                System.out.println("Confusion Matrix:");
+                System.out.printf(
+                        "Training time: %.3f seconds%n",
+                        trainingSeconds);
 
+                System.out.printf(
+                        "Inference time: %.3f seconds%n",
+                        inferenceSeconds);
+
+                System.out.println("\nConfusion Matrix:");
                 System.out.println(
                         "TN = " + tn + " | FP = " + fp);
 
@@ -258,6 +305,7 @@ public class XGBoostTrainer {
 
             } finally {
 
+                // STEP 14: Release native resources
                 if (model != null) {
                     model.dispose();
                 }
@@ -272,10 +320,10 @@ public class XGBoostTrainer {
             }
         }
 
-        System.out.println();
-        System.out.println("==================================");
+        // STEP 15: Calculate mean CV results
+        System.out.println("\n====================================");
         System.out.println("5-FOLD CROSS-VALIDATION SUMMARY");
-        System.out.println("==================================");
+        System.out.println("====================================");
 
         System.out.printf(
                 "Mean Precision: %.4f%n",
@@ -293,14 +341,24 @@ public class XGBoostTrainer {
                 "Mean Average Precision: %.4f%n",
                 mean(foldAP));
 
-        System.out.println();
-        System.out.println(
-                "Final holdout remains untouched.");
+        System.out.printf(
+                "Mean False Positive Rate: %.4f%n",
+                mean(foldFPR));
 
+        System.out.printf(
+                "Mean Training Time: %.3f seconds%n",
+                mean(foldTrainingTime));
+
+        System.out.printf(
+                "Mean Inference Time: %.3f seconds%n",
+                mean(foldInferenceTime));
+
+        System.out.println("\nFinal holdout remains untouched.");
         System.out.println(
-                "Baseline XGBoost cross-validation completed.");
+                "17-feature weighted XGBoost baseline completed.");
     }
 
+    // Convert Consumer objects to XGBoost DMatrix
     private static DMatrix createMatrix(
             List<XGBoostDataLoader.Consumer> consumers)
             throws Exception {
@@ -312,22 +370,22 @@ public class XGBoostTrainer {
 
         for (int i = 0; i < rows; i++) {
 
-            XGBoostDataLoader.Consumer consumer =
+            XGBoostDataLoader.Consumer c =
                     consumers.get(i);
 
-            if (consumer.features.length != NUM_FEATURES) {
+            if (c.features.length != NUM_FEATURES) {
                 throw new IllegalArgumentException(
                         "Incorrect number of features.");
             }
 
             System.arraycopy(
-                    consumer.features,
+                    c.features,
                     0,
                     data,
                     i * NUM_FEATURES,
                     NUM_FEATURES);
 
-            labels[i] = consumer.label;
+            labels[i] = c.label;
         }
 
         DMatrix matrix = new DMatrix(
@@ -341,6 +399,7 @@ public class XGBoostTrainer {
         return matrix;
     }
 
+    // Average Precision for ranked predictions
     private static double averagePrecision(
             double[] scores,
             int[] labels) {
@@ -362,6 +421,7 @@ public class XGBoostTrainer {
             return 0.0;
         }
 
+        // Sort by highest predicted probability
         Arrays.sort(
                 order,
                 Comparator.comparingDouble(
@@ -387,6 +447,7 @@ public class XGBoostTrainer {
         return precisionSum / positiveCount;
     }
 
+    // Safe division
     private static double divide(
             double numerator,
             double denominator) {
@@ -396,6 +457,7 @@ public class XGBoostTrainer {
                 : numerator / denominator;
     }
 
+    // Calculate arithmetic mean
     private static double mean(List<Double> values) {
 
         return values.stream()

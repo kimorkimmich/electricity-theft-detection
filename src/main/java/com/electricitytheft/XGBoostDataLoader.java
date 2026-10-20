@@ -25,12 +25,19 @@ public class XGBoostDataLoader {
         "STD_DEV",
         "MIN",
         "MAX",
+        "MEDIAN",
         "CV",
         "PAR",
-        "TOTAL",
+        "SKEWNESS",
+        "P10",
+        "P90",
+        "ZERO_READING_RATE",
         "TREND",
         "LAG7_AUTOCORR",
-        "CONSUMPTION_DEVIATION"
+        "WEEKEND_WEEKDAY_RATIO",
+        "MONTHLY_VARIABILITY",
+        "MAX_ROLLING_DROP",
+        "LONGEST_LOW_CONSUMPTION_STREAK"
     };
 
     private static final Path FEATURES_PATH =
@@ -40,20 +47,15 @@ public class XGBoostDataLoader {
             Paths.get("dataset", "sgcc_split_assignments.csv");
 
     public static class Consumer {
-
         public final String consumerId;
         public final int label;
         public final float[] features;
         public final boolean development;
         public final int fold;
 
-        public Consumer(
-                String consumerId,
-                int label,
-                float[] features,
-                boolean development,
-                int fold) {
-
+        public Consumer(String consumerId, int label,
+                        float[] features, boolean development,
+                        int fold) {
             this.consumerId = consumerId;
             this.label = label;
             this.features = features;
@@ -63,16 +65,11 @@ public class XGBoostDataLoader {
     }
 
     private static class SplitInfo {
-
         final int label;
         final boolean development;
         final int fold;
 
-        SplitInfo(
-                int label,
-                boolean development,
-                int fold) {
-
+        SplitInfo(int label, boolean development, int fold) {
             this.label = label;
             this.development = development;
             this.fold = fold;
@@ -80,15 +77,11 @@ public class XGBoostDataLoader {
     }
 
     public static List<Consumer> load() throws IOException {
-
-        if (!Files.exists(FEATURES_PATH)) {
-            throw new IOException(
-                    "Missing file: " + FEATURES_PATH.toAbsolutePath());
+        if (!Files.isRegularFile(FEATURES_PATH)) {
+            throw new IOException("Missing: " + FEATURES_PATH);
         }
-
-        if (!Files.exists(SPLITS_PATH)) {
-            throw new IOException(
-                    "Missing file: " + SPLITS_PATH.toAbsolutePath());
+        if (!Files.isRegularFile(SPLITS_PATH)) {
+            throw new IOException("Missing: " + SPLITS_PATH);
         }
 
         Map<String, SplitInfo> assignments =
@@ -97,52 +90,35 @@ public class XGBoostDataLoader {
         List<Consumer> consumers = new ArrayList<>();
         Set<String> seenIds = new HashSet<>();
 
-        try (
-            Reader reader = Files.newBufferedReader(
-                    FEATURES_PATH,
-                    StandardCharsets.UTF_8);
-
-            CSVParser parser = CSVFormat.DEFAULT.builder()
+        try (Reader reader = Files.newBufferedReader(
+                    FEATURES_PATH, StandardCharsets.UTF_8);
+             CSVParser parser = CSVFormat.DEFAULT.builder()
                     .setHeader()
                     .setSkipHeaderRecord(true)
-                    .get()
-                    .parse(reader)
-        ) {
+                    .get().parse(reader)) {
 
-            requireColumns(
-                    parser,
-                    "CONS_NO",
-                    "FLAG");
-
-            for (String feature : FEATURE_NAMES) {
-                requireColumns(parser, feature);
-            }
+            requireColumns(parser, "CONS_NO", "FLAG");
+            requireColumns(parser, FEATURE_NAMES);
 
             for (CSVRecord record : parser) {
-
                 String id = record.get("CONS_NO").trim();
 
-                if (id.isEmpty()) {
-                    throw new IOException("Empty consumer ID.");
-                }
-
-                if (!seenIds.add(id)) {
+                if (id.isEmpty() || !seenIds.add(id)) {
                     throw new IOException(
-                            "Duplicate feature ID: " + id);
+                            "Empty or duplicate consumer ID: " + id);
                 }
 
                 SplitInfo split = assignments.get(id);
-
                 if (split == null) {
                     throw new IOException(
-                            "No split assignment for: " + id);
+                            "Missing split assignment: " + id);
                 }
 
                 int label = parseLabel(record.get("FLAG"));
 
                 if (label != split.label) {
                     throw new IOException(
-                            "FLAG mismatch for consumer: " + id);
+                            "FLAG mismatch for: " + id);
                 }
 
                 float[] features =
@@ -154,20 +130,19 @@ public class XGBoostDataLoader {
                 }
 
                 consumers.add(new Consumer(
-                        id,
-                        label,
-                        features,
-                        split.development,
-                        split.fold));
+                        id, label, features,
+                        split.development, split.fold));
             }
         }
 
         if (seenIds.size() != assignments.size()) {
             throw new IOException(
-                    "Some split assignments have no matching feature row. "
-                    + "Features: " + seenIds.size()
-                    + ", assignments: " + assignments.size());
+                    "Feature rows and split assignments do not match.");
         }
+
+        System.out.println("Loaded " + consumers.size()
+                + " consumers with "
+                + FEATURE_NAMES.length + " features.");
 
         return consumers;
     }
@@ -175,82 +150,54 @@ public class XGBoostDataLoader {
     private static Map<String, SplitInfo>
             readSplitAssignments() throws IOException {
 
-        Map<String, SplitInfo> assignments =
-                new HashMap<>();
+        Map<String, SplitInfo> assignments = new HashMap<>();
 
-        try (
-            Reader reader = Files.newBufferedReader(
-                    SPLITS_PATH,
-                    StandardCharsets.UTF_8);
-
-            CSVParser parser = CSVFormat.DEFAULT.builder()
+        try (Reader reader = Files.newBufferedReader(
+                    SPLITS_PATH, StandardCharsets.UTF_8);
+             CSVParser parser = CSVFormat.DEFAULT.builder()
                     .setHeader()
                     .setSkipHeaderRecord(true)
-                    .get()
-                    .parse(reader)
-        ) {
+                    .get().parse(reader)) {
 
-            requireColumns(
-                    parser,
-                    "CONS_NO",
-                    "FLAG",
-                    "SPLIT",
-                    "CV_FOLD");
+            requireColumns(parser,
+                    "CONS_NO", "FLAG", "SPLIT", "CV_FOLD");
 
             for (CSVRecord record : parser) {
-
                 String id = record.get("CONS_NO").trim();
 
                 if (id.isEmpty()) {
-                    throw new IOException(
-                            "Empty consumer ID in split file.");
+                    throw new IOException("Empty split ID.");
                 }
 
-                int label = parseLabel(
-                        record.get("FLAG"));
-
+                int label = parseLabel(record.get("FLAG"));
                 String split = record.get("SPLIT")
-                        .trim()
-                        .toLowerCase();
+                        .trim().toLowerCase();
 
-                boolean development;
-
-                if (split.equals("development")) {
-                    development = true;
-                } else if (
-                        split.equals("test")
-                        || split.equals("holdout")
-                        || split.equals("final_test")) {
-                    development = false;
-                } else {
-                    throw new IOException(
-                            "Unknown SPLIT value: " + split);
-                }
+                boolean development = switch (split) {
+                    case "development" -> true;
+                    case "test", "holdout", "final_test" -> false;
+                    default -> throw new IOException(
+                            "Unknown split: " + split);
+                };
 
                 int fold = -1;
-
                 if (development) {
-
                     try {
                         fold = Integer.parseInt(
                                 record.get("CV_FOLD").trim());
-                    } catch (NumberFormatException ex) {
+                    } catch (NumberFormatException e) {
                         throw new IOException(
-                                "Invalid CV fold for: " + id, ex);
+                                "Invalid fold for: " + id, e);
                     }
 
-                    if (fold < 0 || fold > 4) {
+                    if (fold < 0 || fold >= 5) {
                         throw new IOException(
-                                "CV_FOLD must be 0 to 4: " + id);
+                                "Fold must be 0-4: " + id);
                     }
                 }
 
                 SplitInfo previous = assignments.put(
-                        id,
-                        new SplitInfo(
-                                label,
-                                development,
-                                fold));
+                        id, new SplitInfo(label, development, fold));
 
                 if (previous != null) {
                     throw new IOException(
@@ -263,67 +210,50 @@ public class XGBoostDataLoader {
     }
 
     private static void requireColumns(
-            CSVParser parser,
-            String... columns) throws IOException {
+            CSVParser parser, String... names) throws IOException {
 
-        Map<String, Integer> headers =
-                parser.getHeaderMap();
+        Map<String, Integer> headers = parser.getHeaderMap();
 
-        for (String column : columns) {
-
-            if (!headers.containsKey(column)) {
+        for (String name : names) {
+            if (!headers.containsKey(name)) {
                 throw new IOException(
-                        "Missing CSV column: " + column);
+                        "Missing CSV column: " + name);
             }
         }
     }
 
-    private static int parseLabel(
-            String value) throws IOException {
-
-        String cleaned = value.trim();
-
-        if (cleaned.equals("0")) {
-            return 0;
-        }
-
-        if (cleaned.equals("1")) {
-            return 1;
-        }
-
-        throw new IOException(
-                "Invalid FLAG value: " + value);
+    private static int parseLabel(String value)
+            throws IOException {
+        return switch (value.trim()) {
+            case "0" -> 0;
+            case "1" -> 1;
+            default -> throw new IOException(
+                    "Invalid FLAG: " + value);
+        };
     }
 
-    private static float parseFeature(
-            String value) throws IOException {
+    private static float parseFeature(String value)
+            throws IOException {
 
-        String cleaned = value.trim();
+        String text = value.trim();
 
-        // Missing feature values remain missing.
-        // They are not replaced with zero.
-        if (cleaned.isEmpty()
-                || cleaned.equalsIgnoreCase("nan")) {
+        if (text.isEmpty() || text.equalsIgnoreCase("NaN")) {
             return Float.NaN;
         }
 
         try {
+            double number = Double.parseDouble(text);
 
-            double parsed = Double.parseDouble(cleaned);
-
-            if (!Double.isFinite(parsed)
-                    || Math.abs(parsed) > Float.MAX_VALUE) {
-
+            if (!Double.isFinite(number)
+                    || Math.abs(number) > Float.MAX_VALUE) {
                 throw new IOException(
-                        "Invalid feature value: " + value);
+                        "Invalid feature: " + value);
             }
 
-            return (float) parsed;
-
-        } catch (NumberFormatException ex) {
-
+            return (float) number;
+        } catch (NumberFormatException e) {
             throw new IOException(
-                    "Cannot parse feature: " + value, ex);
+                    "Cannot parse feature: " + value, e);
         }
     }
 }
