@@ -29,7 +29,6 @@ public class StratifiedFiveFoldSplitter {
     static class Customer {
         String id;
         int flag;
-        String split;
         int fold;
 
         Customer(String id, int flag) {
@@ -104,17 +103,12 @@ public class StratifiedFiveFoldSplitter {
                                     + lineNumber);
                 }
 
-                int flag;
-
-                if (label.equals("0")) {
-                    flag = 0;
-                } else if (label.equals("1")) {
-                    flag = 1;
-                } else {
-                    throw new IllegalArgumentException(
-                            "Invalid FLAG at line " + lineNumber);
-                }
-
+                int flag = switch (label) {
+                case "0" -> 0;
+                case "1" -> 1;
+                default -> throw new IllegalArgumentException(
+                        "Invalid FLAG at line " + lineNumber);
+            };
                 Customer customer = new Customer(id, flag);
 
                 if (flag == 0) {
@@ -207,10 +201,8 @@ public class StratifiedFiveFoldSplitter {
             Customer c = source.get(i);
 
             if (i < testCount) {
-                c.split = "test";
                 test.add(c);
             } else {
-                c.split = "development";
                 development.add(c);
             }
         }
